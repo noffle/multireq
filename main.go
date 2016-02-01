@@ -7,142 +7,147 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
+
+	"github.com/asaskevich/govalidator"
 )
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Println("usage: multireq <listen addr> <target A> <target B>")
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "USAGE: multireq [listen-addr] [target]...")
 		os.Exit(1)
 	}
 
 	listen := os.Args[1]
 	targets := os.Args[2:]
-	if !strings.HasPrefix(targets[0], "http") {
-		fmt.Println("must specify http targets")
-		os.Exit(1)
-	}
-	if !strings.HasPrefix(targets[1], "http") {
-		fmt.Println("must specify http targets")
-		os.Exit(1)
-	}
+	urls := make([]*url.URL, len(targets))
 
-	ua, err := url.Parse(targets[0])
-	if err != nil {
-		panic(err)
+	failed := false
+	for i, v := range targets {
+		// Verify the target is HTTP or HTTPS.
+		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+			fmt.Fprintf(os.Stderr, "%s: must be an http(s) URL.\n", v)
+			failed = true
+			continue
+		}
+		// Validate the URL.
+		if !govalidator.IsURL(v) {
+			fmt.Fprintf(os.Stderr, "%s: must be a valid URL.\n", v)
+			failed = true
+			continue
+		}
+		// Parse the target as a URL.
+		ua, err := url.Parse(v)
+		if err != nil {
+			panic(err)
+			continue
+		}
+		urls[i] = ua
 	}
-	ub, err := url.Parse(targets[1])
-	if err != nil {
-		panic(err)
+	if failed {
+		os.Exit(1)
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		resp_a := make(chan *http.Response)
-		resp_b := make(chan *http.Response)
+		// Allocate channels for each target's HTTP request.
+		channels := make([]chan *http.Response, len(targets))
+		for i := range channels {
+			channels[i] = make(chan *http.Response)
+		}
 
-		fail_a := make(chan struct{})
-		fail_b := make(chan struct{})
-		fail := make(chan struct{})
+		// Allocate a cancellation channel for each target's HTTP request.
+		cancels := make([]chan struct{}, len(targets))
 
-		cancel_a := make(chan struct{})
-		cancel_b := make(chan struct{})
+		// Allocate a failure channel for each target's HTTP request.
+		fails := make([]chan struct{}, len(targets))
 
 		r.RequestURI = ""
 		r.URL.Scheme = "http"
 
-		go func() {
-			req_a := *r
-			req_a.URL.Host = ua.Host
-			req_a.URL, _ = url.Parse(r.URL.String())
-			req_a.Cancel = cancel_a
+		// Create and send out an HTTP request to each target.
+		for i := range targets {
+			req := *r
+			req.URL.Host = urls[i].Host
+			req.URL, _ = url.Parse(r.URL.String())
+			cancels[i] = make(chan struct{})
+			fails[i] = make(chan struct{})
+			req.Cancel = cancels[i]
+			fail := fails[i]
 
-			rt := &http.Transport{DisableKeepAlives: true}
-			resp, err := rt.RoundTrip(&req_a)
-			if err != nil {
-				log.Printf("target A failed: %s", err)
-				close(fail_a)
-			} else if resp.StatusCode >= 500 || resp.StatusCode == 408 {
-				log.Printf("target A unsatisfying status: %d", resp.StatusCode)
-				close(fail_a)
-			} else {
-				resp_a <- resp
+			channel := channels[i]
+
+			go func() {
+				rt := &http.Transport{DisableKeepAlives: true}
+				res, err := rt.RoundTrip(&req)
+				if err != nil {
+					log.Printf("request failed: %s\n", err)
+					close(fail)
+				} else if res.StatusCode >= 500 || res.StatusCode == 408 {
+					log.Printf("target (%s) unsatisfying status: %d", req.URL, res.StatusCode)
+					close(fail)
+				} else {
+					log.Printf("target (%s) responded with %d", req.URL, res.StatusCode)
+					channel <- res
+				}
+			}()
+		}
+
+		// Listen to all requests' failure channels; issue a signal when all requests fail.
+		failed := make(chan struct{})
+		go func() {
+			for i := range fails {
+				<-fails[i]
 			}
+			close(failed)
 		}()
 
-		go func() {
-			req_b := *r
-			req_b.URL, _ = url.Parse(r.URL.String())
-			req_b.URL.Host = ub.Host
-			req_b.Cancel = cancel_b
+		// Listen to the request channels for a response.
+		cases := make([]reflect.SelectCase, len(channels)+1)
+		for i, ch := range channels {
+			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)}
+		}
+		// Plus an extra channel for the failure case.
+		cases[len(channels)] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(failed)}
 
-			rt := &http.Transport{DisableKeepAlives: true}
-			resp, err := rt.RoundTrip(&req_b)
-			if err != nil {
-				log.Printf("target B failed: %s", err)
-				close(fail_b)
-			} else if resp.StatusCode >= 500 || resp.StatusCode == 408 {
-				log.Printf("target B unsatisfying status: %d", resp.StatusCode)
-				close(fail_b)
-			} else {
-				resp_b <- resp
-			}
-		}()
-
-		go func() {
-			<-fail_a
-			<-fail_b
-			close(fail)
-		}()
-
-		var ra *http.Response
-		var rb *http.Response
-		var resp *http.Response
-		done := false
-	OuterLoop:
+		// Wait for a successful response (or failures across the board).
 		for {
-			select {
-			case ra = <-resp_a:
-				if !done {
-					done = true
-					resp = ra
-					log.Print("close cancel_b")
-					close(cancel_b)
-					break OuterLoop
+			chosen, value, ok := reflect.Select(cases)
+			if ok {
+				// Handle the case where all requests have met failure.
+				if value.Interface() == failed {
+					w.WriteHeader(503)
+					break
 				}
-			case rb = <-resp_b:
-				if !done {
-					done = true
-					resp = rb
-					log.Print("close cancel_a")
-					close(cancel_a)
-					break OuterLoop
+
+				res := value.Interface().(*http.Response)
+
+				// Close all of the other pending request channels.
+				for i := range cancels {
+					if i != chosen {
+						close(cancels[i])
+					}
 				}
-			case <-fail:
-				log.Print("both failed")
-				break OuterLoop
+				// Copy headers over.
+				for k, v := range res.Header {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(res.StatusCode)
+
+				written, err := io.Copy(w, res.Body)
+				if err != nil {
+					log.Printf("io.Copy error: %s", err)
+				}
+				log.Printf("io.Copy %d bytes written", written)
+				break
 			}
 		}
-
-		if !done {
-			w.WriteHeader(503)
-			return
-		}
-
-		for k, v := range resp.Header {
-			w.Header()[k] = v
-		}
-		w.WriteHeader(resp.StatusCode)
-		written, err := io.Copy(w, resp.Body)
-		if err != nil {
-			log.Printf("io.Copy error: %s", err)
-		}
-		log.Printf("io.Copy %d bytes written", written)
 	})
 
 	log.Printf("listening on %s", listen)
-	err = http.ListenAndServe(listen, nil)
+	err := http.ListenAndServe(listen, nil)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
