@@ -13,6 +13,23 @@ import (
 	"github.com/asaskevich/govalidator"
 )
 
+func validateUrl(u string) (*url.URL, error) {
+	// Verify the target is HTTP or HTTPS.
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return nil, fmt.Errorf("%s: must be an http(s) URL.\n", u)
+	}
+	// Validate the URL.
+	if !govalidator.IsURL(u) {
+		return nil, fmt.Errorf("%s: must be a valid URL.\n", u)
+	}
+	// Parse the target as a URL.
+	ua, err := url.Parse(u)
+	if err != nil {
+		panic(err)
+	}
+	return ua, nil
+}
+
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "USAGE: multireq [listen-addr] [target]...")
@@ -25,22 +42,10 @@ func main() {
 
 	failed := false
 	for i, v := range targets {
-		// Verify the target is HTTP or HTTPS.
-		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
-			fmt.Fprintf(os.Stderr, "%s: must be an http(s) URL.\n", v)
-			failed = true
-			continue
-		}
-		// Validate the URL.
-		if !govalidator.IsURL(v) {
-			fmt.Fprintf(os.Stderr, "%s: must be a valid URL.\n", v)
-			failed = true
-			continue
-		}
-		// Parse the target as a URL.
-		ua, err := url.Parse(v)
+		ua, err := validateUrl(v)
 		if err != nil {
-			panic(err)
+			fmt.Println(err.Error())
+			failed = true
 			continue
 		}
 		urls[i] = ua
