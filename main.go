@@ -145,6 +145,11 @@ func main() {
 				}
 				log.Printf("io.Copy %d bytes written", written)
 				break
+			} else {
+				// Handle failure.
+				w.WriteHeader(500)
+				w.(http.Flusher).Flush()
+				break
 			}
 		}
 	})
