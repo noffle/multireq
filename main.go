@@ -35,6 +35,7 @@ func main() {
 			200: true,
 			304: true,
 			302: true,
+			404: true,
 		}
 
 		r.RequestURI = ""
