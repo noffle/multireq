@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"reflect"
 	"strings"
 
 	"github.com/asaskevich/govalidator"
@@ -18,15 +17,18 @@ func validateUrl(u string) (*url.URL, error) {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return nil, fmt.Errorf("%s: must be an http(s) URL.\n", u)
 	}
+
 	// Validate the URL.
 	if !govalidator.IsURL(u) {
 		return nil, fmt.Errorf("%s: must be a valid URL.\n", u)
 	}
+
 	// Parse the target as a URL.
 	ua, err := url.Parse(u)
 	if err != nil {
 		panic(err)
 	}
+
 	return ua, nil
 }
 
@@ -44,7 +46,7 @@ func main() {
 	for i, v := range targets {
 		ua, err := validateUrl(v)
 		if err != nil {
-			fmt.Println(err.Error())
+			fmt.Fprintln(os.Stderr, err)
 			failed = true
 			continue
 		}
@@ -55,11 +57,8 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Allocate channels for each target's HTTP request.
-		channels := make([]chan *http.Response, len(targets))
-		for i := range channels {
-			channels[i] = make(chan *http.Response)
-		}
+		// Allocate a channel for the HTTP responses.
+		responses := make(chan *http.Response, len(targets))
 
 		// Allocate a cancellation channel for each target's HTTP request.
 		cancels := make([]chan struct{}, len(targets))
@@ -80,8 +79,6 @@ func main() {
 			req.Cancel = cancels[i]
 			fail := fails[i]
 
-			channel := channels[i]
-
 			go func() {
 				rt := &http.Transport{DisableKeepAlives: true}
 				res, err := rt.RoundTrip(&req)
@@ -93,7 +90,7 @@ func main() {
 					close(fail)
 				} else {
 					log.Printf("target (%s) responded with %d", req.URL, res.StatusCode)
-					channel <- res
+					responses <- res
 				}
 			}()
 		}
@@ -107,30 +104,12 @@ func main() {
 			close(failed)
 		}()
 
-		// Listen to the request channels for a response.
-		cases := make([]reflect.SelectCase, len(channels)+1)
-		for i, ch := range channels {
-			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)}
-		}
-		// Plus an extra channel for the failure case.
-		cases[len(channels)] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(failed)}
-
 		// Wait for a successful response (or failures across the board).
-		for {
-			chosen, value, _ := reflect.Select(cases)
-			// Handle the case where all requests have met failure.
-			if value.Kind() == reflect.Struct {
-				w.WriteHeader(503)
-				break
-			}
-
-			res := value.Interface().(*http.Response)
-
-			// Close all of the other pending request channels.
-			for i := range cancels {
-				if i != chosen {
-					close(cancels[i])
-				}
+		select {
+		case res := <-responses:
+			// Close all of the pending request channels.
+			for _, c := range cancels {
+				close(c)
 			}
 			// Copy headers over.
 			for k, v := range res.Header {
@@ -143,7 +122,10 @@ func main() {
 				log.Printf("io.Copy error: %s", err)
 			}
 			log.Printf("io.Copy %d bytes written", written)
-			break
+		case <-failed:
+			// All requests have met failure.
+			w.WriteHeader(503)
+			w.(http.Flusher).Flush()
 		}
 	})
 
