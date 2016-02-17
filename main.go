@@ -117,40 +117,33 @@ func main() {
 
 		// Wait for a successful response (or failures across the board).
 		for {
-			chosen, value, ok := reflect.Select(cases)
-			if ok {
-				// Handle the case where all requests have met failure.
-				if value.Interface() == failed {
-					w.WriteHeader(503)
-					break
-				}
-
-				res := value.Interface().(*http.Response)
-
-				// Close all of the other pending request channels.
-				for i := range cancels {
-					if i != chosen {
-						close(cancels[i])
-					}
-				}
-				// Copy headers over.
-				for k, v := range res.Header {
-					w.Header()[k] = v
-				}
-				w.WriteHeader(res.StatusCode)
-
-				written, err := io.Copy(w, res.Body)
-				if err != nil {
-					log.Printf("io.Copy error: %s", err)
-				}
-				log.Printf("io.Copy %d bytes written", written)
-				break
-			} else {
-				// Handle failure.
-				w.WriteHeader(500)
-				w.(http.Flusher).Flush()
+			chosen, value, _ := reflect.Select(cases)
+			// Handle the case where all requests have met failure.
+			if value.Kind() == reflect.Struct {
+				w.WriteHeader(503)
 				break
 			}
+
+			res := value.Interface().(*http.Response)
+
+			// Close all of the other pending request channels.
+			for i := range cancels {
+				if i != chosen {
+					close(cancels[i])
+				}
+			}
+			// Copy headers over.
+			for k, v := range res.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(res.StatusCode)
+
+			written, err := io.Copy(w, res.Body)
+			if err != nil {
+				log.Printf("io.Copy error: %s", err)
+			}
+			log.Printf("io.Copy %d bytes written", written)
+			break
 		}
 	})
 
