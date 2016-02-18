@@ -60,11 +60,14 @@ func main() {
 		// Allocate a channel for the HTTP responses.
 		responses := make(chan *http.Response, len(targets))
 
-		// Allocate a cancellation channel for each target's HTTP request.
+		// Allocate a cancellation channel for the targets' HTTP requests.
 		cancels := make([]chan struct{}, len(targets))
 
-		// Allocate a failure channel for each target's HTTP request.
-		fails := make([]chan struct{}, len(targets))
+		// Allocate a failure channel to collect failed HTTP requests.
+		fails := make(chan bool, len(targets))
+
+		// Channel to indicate all requests have failed.
+		allFailed := make(chan struct{})
 
 		r.RequestURI = ""
 		r.URL.Scheme = "http"
@@ -75,57 +78,69 @@ func main() {
 			req.URL.Host = urls[i].Host
 			req.URL, _ = url.Parse(r.URL.String())
 			cancels[i] = make(chan struct{})
-			fails[i] = make(chan struct{})
 			req.Cancel = cancels[i]
-			fail := fails[i]
 
 			go func() {
 				rt := &http.Transport{DisableKeepAlives: true}
 				res, err := rt.RoundTrip(&req)
-				if err != nil {
+
+				switch {
+				case err != nil:
 					log.Printf("request failed: %s\n", err)
-					close(fail)
-				} else if res.StatusCode >= 500 || res.StatusCode == 408 {
+					fails <- true
+				case res.StatusCode >= 500 || res.StatusCode == 408:
 					log.Printf("target (%s) unsatisfying status: %d", req.URL, res.StatusCode)
-					close(fail)
-				} else {
+					fails <- true
+				default:
 					log.Printf("target (%s) responded with %d", req.URL, res.StatusCode)
 					responses <- res
 				}
 			}()
 		}
 
-		// Listen to all requests' failure channels; issue a signal when all requests fail.
-		failed := make(chan struct{})
+		// Listen to the requests' failure channel; close it when all requests fail.
 		go func() {
-			for i := range fails {
-				<-fails[i]
+			for i := 0; i < len(targets); i++ {
+				_, ok := <-fails
+				if !ok {
+					return
+				}
 			}
-			close(failed)
+
+			// Close the channel, signalling that all requests have failed.
+			close(allFailed)
 		}()
 
 		// Wait for a successful response (or failures across the board).
-		select {
-		case res := <-responses:
-			// Close all of the pending request channels.
-			for _, c := range cancels {
-				close(c)
-			}
-			// Copy headers over.
-			for k, v := range res.Header {
-				w.Header()[k] = v
-			}
-			w.WriteHeader(res.StatusCode)
+		for {
+			select {
+			case res := <-responses:
+				// Close the cancel channels.
+				for _, c := range cancels {
+					close(c)
+				}
 
-			written, err := io.Copy(w, res.Body)
-			if err != nil {
-				log.Printf("io.Copy error: %s", err)
+				// Copy headers over.
+				for k, v := range res.Header {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(res.StatusCode)
+
+				written, err := io.Copy(w, res.Body)
+				if err != nil {
+					log.Printf("io.Copy error: %s", err)
+				}
+
+				log.Printf("io.Copy %d bytes written", written)
+				return
+			case _, ok := <-allFailed:
+				if !ok {
+					// All requests have met failure.
+					w.WriteHeader(503)
+					w.(http.Flusher).Flush()
+					return
+				}
 			}
-			log.Printf("io.Copy %d bytes written", written)
-		case <-failed:
-			// All requests have met failure.
-			w.WriteHeader(503)
-			w.(http.Flusher).Flush()
 		}
 	})
 
